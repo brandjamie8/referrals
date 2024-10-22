@@ -16,7 +16,7 @@ uploaded_file = st.file_uploader("Upload your dataset (CSV file with 'date' and 
 if uploaded_file is not None:
    # Load the dataset
    data = pd.read_csv(uploaded_file)
-   data['date'] = pd.to_datetime(data['date'])
+   data['date'] = pd.to_datetime(data['date'], format='%d-%m-%Y')
    data.set_index('date', inplace=True)
    st.write("### Data preview:")
    st.write(data.head())
