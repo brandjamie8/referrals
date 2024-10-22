@@ -2,29 +2,38 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.linear_model import LinearRegression
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.arima.model import ARIMA
-from sklearn.dummy import DummyRegressor
-from datetime import timedelta
+from prophet import Prophet
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM
+from sklearn.preprocessing import MinMaxScaler
 # Title
 st.title("Time Series Prediction for Referrals")
+# Frequency selection
+frequency = st.selectbox("Select the frequency of your data:", ["Daily", "Weekly", "Monthly"])
 # Upload the dataset
 uploaded_file = st.file_uploader("Upload your dataset (CSV file with 'date' and 'referrals' columns)", type="csv")
 if uploaded_file is not None:
    # Load the dataset
    data = pd.read_csv(uploaded_file)
-   data['date'] = pd.to_datetime(data['date'], format='%d/%m/%Y')
+   data['date'] = pd.to_datetime(data['date'])
    data.set_index('date', inplace=True)
+   # Resample based on the frequency
+   if frequency == "Daily":
+       data = data.resample('D').sum()
+   elif frequency == "Weekly":
+       data = data.resample('W').sum()
+   elif frequency == "Monthly":
+       data = data.resample('M').sum()
    st.write("### Data preview:")
    st.write(data.head())
    # Plot the time series
    st.write("### Time Series Plot:")
    plt.figure(figsize=(10, 6))
    plt.plot(data.index, data['referrals'], label="Referrals")
-   plt.title("Daily Referrals")
+   plt.title(f"{frequency} Referrals")
    plt.xlabel("Date")
    plt.ylabel("Referrals")
    plt.grid()
@@ -34,28 +43,61 @@ if uploaded_file is not None:
    train_size = int(len(data) * split_ratio)
    train, test = data.iloc[:train_size], data.iloc[train_size:]
    st.write("### Train/Test Split:")
-   st.write(f"Train size: {train.shape[0]} days, Test size: {test.shape[0]} days")
-   # Define models
-   models = {
-       "Linear Regression": LinearRegression(),
-       "ARIMA": ARIMA(train['referrals'], order=(5, 1, 0)),
-       "Exponential Smoothing": ExponentialSmoothing(train['referrals'], trend="add", seasonal="add", seasonal_periods=7),
-       "Baseline (Mean)": DummyRegressor(strategy="mean")
+   st.write(f"Train size: {train.shape[0]} periods, Test size: {test.shape[0]} periods")
+   # Model 1: Prophet
+   prophet_data = data.reset_index().rename(columns={'date': 'ds', 'referrals': 'y'})
+   prophet_train = prophet_data.iloc[:train_size]
+   prophet_test = prophet_data.iloc[train_size:]
+   prophet_model = Prophet()
+   prophet_model.fit(prophet_train)
+   future = prophet_model.make_future_dataframe(periods=len(test), freq=frequency[0])
+   prophet_forecast = prophet_model.predict(future)
+   y_pred_prophet = prophet_forecast['yhat'].iloc[-len(test):].values
+   # Model 2: LSTM
+   scaler = MinMaxScaler(feature_range=(0, 1))
+   scaled_train = scaler.fit_transform(train)
+   X_train, y_train = [], []
+   for i in range(60, len(scaled_train)):
+       X_train.append(scaled_train[i - 60:i, 0])
+       y_train.append(scaled_train[i, 0])
+   X_train, y_train = np.array(X_train), np.array(y_train)
+   # Reshape input to be [samples, time steps, features]
+   X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+   lstm_model = Sequential()
+   lstm_model.add(LSTM(units=50, return_sequences=True, input_shape=(X_train.shape[1], 1)))
+   lstm_model.add(LSTM(units=50))
+   lstm_model.add(Dense(1))
+   lstm_model.compile(optimizer='adam', loss='mean_squared_error')
+   lstm_model.fit(X_train, y_train, epochs=5, batch_size=32)
+   total_data = pd.concat((train, test), axis=0)
+   inputs = total_data[len(total_data) - len(test) - 60:].values
+   inputs = inputs.reshape(-1, 1)
+   inputs = scaler.transform(inputs)
+   X_test = []
+   for i in range(60, len(inputs)):
+       X_test.append(inputs[i - 60:i, 0])
+   X_test = np.array(X_test)
+   X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+   y_pred_lstm = lstm_model.predict(X_test)
+   y_pred_lstm = scaler.inverse_transform(y_pred_lstm)
+   # Model 3: Random Forest
+   X = np.arange(len(train)).reshape(-1, 1)
+   y = train['referrals'].values
+   rf_model = RandomForestRegressor(n_estimators=100)
+   rf_model.fit(X, y)
+   X_test_rf = np.arange(len(train), len(train) + len(test)).reshape(-1, 1)
+   y_pred_rf = rf_model.predict(X_test_rf)
+   # Baseline model: Mean prediction
+   y_pred_baseline = np.full_like(test['referrals'], train['referrals'].mean())
+   # Collect all predictions
+   predictions = {
+       "Prophet": y_pred_prophet,
+       "LSTM": y_pred_lstm.flatten(),
+       "Random Forest": y_pred_rf,
+       "Baseline (Mean)": y_pred_baseline
    }
-   predictions = {}
    errors = {}
-   # Train and predict with each model
-   for name, model in models.items():
-       if name == "ARIMA":
-           model_fit = model.fit()
-           y_pred = model_fit.forecast(steps=len(test))
-       elif name == "Exponential Smoothing":
-           model_fit = model.fit()
-           y_pred = model_fit.forecast(steps=len(test))
-       else:
-           model.fit(np.arange(len(train)).reshape(-1, 1), train['referrals'])
-           y_pred = model.predict(np.arange(len(train), len(train) + len(test)).reshape(-1, 1))
-       predictions[name] = y_pred
+   for name, y_pred in predictions.items():
        errors[name] = {
            "MAE": mean_absolute_error(test['referrals'], y_pred),
            "MSE": mean_squared_error(test['referrals'], y_pred)
@@ -77,19 +119,17 @@ if uploaded_file is not None:
    plt.legend()
    plt.grid()
    st.pyplot(plt)
-   # Predict the next year (365 days) with the best model
-   if best_model == "ARIMA":
-       final_model = models[best_model].fit()
-       future_pred = final_model.forecast(steps=365)
-   elif best_model == "Exponential Smoothing":
-       final_model = models[best_model].fit()
-       future_pred = final_model.forecast(steps=365)
-   else:
-       final_model = models[best_model]
-       future_pred = final_model.predict(np.arange(len(data), len(data) + 365).reshape(-1, 1))
-   future_dates = pd.date_range(start=data.index[-1] + timedelta(days=1), periods=365)
+   # Predict the next year (based on selected frequency)
+   if best_model == "Prophet":
+       future_pred = prophet_model.predict(prophet_model.make_future_dataframe(periods=52, freq=frequency[0]))['yhat'][-52:].values
+   elif best_model == "LSTM":
+       future_pred = lstm_model.predict(X_test)
+       future_pred = scaler.inverse_transform(future_pred)[-52:].flatten()
+   elif best_model == "Random Forest":
+       future_pred = rf_model.predict(np.arange(len(data), len(data) + 52).reshape(-1, 1))
+   future_dates = pd.date_range(start=data.index[-1] + pd.Timedelta(1, 'D'), periods=52, freq=frequency[0])
    future_df = pd.DataFrame(future_pred, index=future_dates, columns=["Predicted Referrals"])
-   st.write("### Next Year's Prediction:")
+   st.write("### Next Year Prediction:")
    st.write(future_df.head())
    # Plot future prediction
    st.write("### Next Year Referrals Prediction Plot:")
